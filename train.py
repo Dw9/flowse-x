@@ -2,8 +2,7 @@ import argparse
 from argparse import ArgumentParser
 import os
 import pytorch_lightning as pl
-from pytorch_lightning.plugins import DDPPlugin
-# from pytorch_lightning.strategies import DDPStrategy
+from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.loggers import WandbLogger, TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
 
@@ -17,96 +16,162 @@ from flowmse.model import VFModel
 from datetime import datetime
 import pytz
 
-kst = pytz.timezone('Asia/Seoul') # 한국 표준시 (KST) 설정
-now_kst = datetime.now(kst) # 현재 한국 시간 가져오기
-formatted_time_kst = now_kst.strftime("%Y%m%d%H%M%S") # YYYYMMDDHHMMSS 형태로 포맷팅
+kst = pytz.timezone("Asia/Seoul")  # 한국 표준시 (KST) 설정
+now_kst = datetime.now(kst)  # 현재 한국 시간 가져오기
+formatted_time_kst = now_kst.strftime("%Y%m%d%H%M%S")  # YYYYMMDDHHMMSS 형태로 포맷팅
 
 
+def get_argparse_groups(parser, args):
+    """Group argparse arguments by their group title."""
+    groups = {}
+    for group in parser._action_groups:
+        group_dict = {a.dest: getattr(args, a.dest, None) for a in group._group_actions}
+        groups[group.title] = argparse.Namespace(**group_dict)
+    return groups
 
-def get_argparse_groups(parser):
-     groups = {}
-     for group in parser._action_groups:
-          group_dict = { a.dest: getattr(args, a.dest, None) for a in group._group_actions }
-          groups[group.title] = argparse.Namespace(**group_dict)
-     return groups
 
+if __name__ == "__main__":
+    # Create parser
+    parser = ArgumentParser()
 
-if __name__ == '__main__':
-     # throwaway parser for dynamic args - see https://stackoverflow.com/a/25320537/3090225
-     base_parser = ArgumentParser(add_help=False)
-     parser = ArgumentParser()
-     for parser_ in (base_parser, parser):
-          parser_.add_argument("--backbone", type=str, choices=BackboneRegistry.get_all_names(), default="ncsnpp")
-          parser_.add_argument("--ode", type=str, choices=ODERegistry.get_all_names(), default="flowmatching")    
-          parser_.add_argument("--no_wandb", action='store_true', help="Turn off logging to W&B, using local default logger instead")
-          
-          
-     temp_args, _ = base_parser.parse_known_args()
+    # Add model and data arguments
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        choices=BackboneRegistry.get_all_names(),
+        default="ncsnpp",
+    )
+    parser.add_argument(
+        "--ode",
+        type=str,
+        choices=ODERegistry.get_all_names(),
+        default="flowmatching",
+    )
+    parser.add_argument(
+        "--no_wandb",
+        action="store_true",
+        help="Turn off logging to W&B, using local default logger instead",
+    )
 
-     # Add specific args for VFModel, pl.Trainer, the SDE class and backbone DNN class
-     backbone_cls = BackboneRegistry.get_by_name(temp_args.backbone)
-     ode_class = ODERegistry.get_by_name(temp_args.ode)
-     parser = pl.Trainer.add_argparse_args(parser)
-     VFModel.add_argparse_args(
-          parser.add_argument_group("VFModel", description=VFModel.__name__))
-     ode_class.add_argparse_args(
-          parser.add_argument_group("ODE", description=ode_class.__name__))
-     backbone_cls.add_argparse_args(
-          parser.add_argument_group("Backbone", description=backbone_cls.__name__))
-     # Add data module args
-     data_module_cls = SpecsDataModule
-     data_module_cls.add_argparse_args(
-          parser.add_argument_group("DataModule", description=data_module_cls.__name__))
-     # Parse args and separate into groups
-     args = parser.parse_args()
-     arg_groups = get_argparse_groups(parser)
-     dataset = os.path.basename(os.path.normpath(args.base_dir))
-     # Initialize logger, trainer, model, datamodule
-     model = VFModel(
-          backbone=args.backbone, ode=args.ode, data_module_cls=data_module_cls,
-          **{
-               **vars(arg_groups['VFModel']),
-               **vars(arg_groups['ODE']),
-               **vars(arg_groups['Backbone']),
-               **vars(arg_groups['DataModule'])
-          }
-     )
-     # Set up logger configuration
-     
+    # Trainer arguments (Lightning 2.x style)
+    parser.add_argument(
+        "--max_epochs", type=int, default=1000, help="Max training epochs"
+    )
+    parser.add_argument(
+        "--devices", type=str, default="auto", help="Number of GPUs or 'auto'"
+    )
+    parser.add_argument(
+        "--accelerator", type=str, default="gpu", help="Accelerator type"
+    )
+    parser.add_argument(
+        "--log_every_n_steps", type=int, default=10, help="Log every N steps"
+    )
+    parser.add_argument(
+        "--num_sanity_val_steps",
+        type=int,
+        default=1,
+        help="Number of sanity validation steps",
+    )
 
-     name_save_dir_path = f"dataset_{dataset}_{formatted_time_kst}"
-     logger = WandbLogger(project=f"FLOWSE", log_model=True, save_dir="logs", name=name_save_dir_path)
+    # Add VFModel arguments
+    VFModel.add_argparse_args(
+        parser.add_argument_group("VFModel", description=VFModel.__name__)
+    )
 
-     logger.experiment.log_code(".")
+    # Add ODE arguments
+    temp_args, _ = parser.parse_known_args()
+    ode_class = ODERegistry.get_by_name(temp_args.ode)
+    ode_class.add_argparse_args(
+        parser.add_argument_group("ODE", description=ode_class.__name__)
+    )
 
-     # Set up callbacks for logger
+    # Add backbone arguments
+    backbone_cls = BackboneRegistry.get_by_name(temp_args.backbone)
+    backbone_cls.add_argparse_args(
+        parser.add_argument_group("Backbone", description=backbone_cls.__name__)
+    )
 
-     model_dirpath = f"logs/{name_save_dir_path}_{logger.version}"
-     callbacks = [ModelCheckpoint(dirpath=model_dirpath, save_last=True, filename='{epoch}_last')]
+    # Add data module arguments
+    data_module_cls = SpecsDataModule
+    data_module_cls.add_argparse_args(
+        parser.add_argument_group("DataModule", description=data_module_cls.__name__)
+    )
 
-     checkpoint_callback_last = ModelCheckpoint(dirpath=model_dirpath,
-          save_last=True, filename='{epoch}_last')
-     checkpoint_callback_pesq = ModelCheckpoint(dirpath=model_dirpath, 
-          save_top_k=20, monitor="pesq", mode="max", filename='{epoch}_{pesq:.2f}')
-     checkpoint_callback_si_sdr = ModelCheckpoint(dirpath=model_dirpath, 
-          save_top_k=20, monitor="si_sdr", mode="max", filename='{epoch}_{si_sdr:.2f}')
-     callbacks = [checkpoint_callback_last, checkpoint_callback_pesq, checkpoint_callback_si_sdr]
+    # Parse all arguments
+    args = parser.parse_args()
+    arg_groups = get_argparse_groups(parser, args)
+    dataset = os.path.basename(os.path.normpath(args.base_dir))
 
-     # Initialize the Trainer and the DataModule
-     trainer = pl.Trainer.from_argparse_args(
-          arg_groups['pl.Trainer'],
-          accelerator='gpu', 
-          strategy=DDPPlugin(find_unused_parameters=False), 
-          gpus=[1], 
-          auto_select_gpus=False, 
-          logger=logger, 
-          log_every_n_steps=10,
-          num_sanity_val_steps=1,
-          max_epochs=1000,
-          callbacks=callbacks
-     )
+    # Initialize model
+    model = VFModel(
+        backbone=args.backbone,
+        ode=args.ode,
+        data_module_cls=data_module_cls,
+        **{
+            **vars(arg_groups["VFModel"]),
+            **vars(arg_groups["ODE"]),
+            **vars(arg_groups["Backbone"]),
+            **vars(arg_groups["DataModule"]),
+        },
+    )
 
-     # Train model
-     trainer.fit(model)
+    # Set up logger configuration
+    name_save_dir_path = f"dataset_{dataset}_{formatted_time_kst}"
 
-   
+    if args.no_wandb:
+        logger = TensorBoardLogger(save_dir="logs", name=name_save_dir_path)
+    else:
+        logger = WandbLogger(
+            project="FLOWSE", log_model=True, save_dir="logs", name=name_save_dir_path
+        )
+        logger.experiment.log_code(".")
+
+    # Set up callbacks
+    model_dirpath = f"logs/{name_save_dir_path}"
+    checkpoint_callback_last = ModelCheckpoint(
+        dirpath=model_dirpath, save_last=True, filename="{epoch}_last"
+    )
+    checkpoint_callback_pesq = ModelCheckpoint(
+        dirpath=model_dirpath,
+        save_top_k=20,
+        monitor="pesq",
+        mode="max",
+        filename="{epoch}_{pesq:.2f}",
+    )
+    checkpoint_callback_si_sdr = ModelCheckpoint(
+        dirpath=model_dirpath,
+        save_top_k=20,
+        monitor="si_sdr",
+        mode="max",
+        filename="{epoch}_{si_sdr:.2f}",
+    )
+    callbacks = [
+        checkpoint_callback_last,
+        checkpoint_callback_pesq,
+        checkpoint_callback_si_sdr,
+    ]
+
+    # Parse devices argument
+    if args.devices == "auto":
+        devices = "auto"
+    else:
+        try:
+            devices = int(args.devices)
+        except ValueError:
+            # Could be a list like [0,1,2,3]
+            devices = args.devices
+
+    # Initialize the Trainer (Lightning 2.x style)
+    trainer = pl.Trainer(
+        accelerator=args.accelerator,
+        devices=devices,
+        strategy="auto",
+        logger=logger,
+        log_every_n_steps=args.log_every_n_steps,
+        num_sanity_val_steps=args.num_sanity_val_steps,
+        max_epochs=args.max_epochs,
+        callbacks=callbacks,
+    )
+
+    # Train model
+    trainer.fit(model)

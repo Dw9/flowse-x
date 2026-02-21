@@ -65,10 +65,10 @@ class FLOWMATCHING(ODE):
     @staticmethod
     def add_argparse_args(parser):        
         parser.add_argument("--sigma_min", type=float, default=0.00, help="The minimum sigma to use. 0.05 by default.")
-        parser.add_argument("--sigma_max",type=float, default=0.487 , help="The maximum sigma to use. 1 by default") 
+        parser.add_argument("--sigma_max",type=float, default=0.5 , help="The maximum sigma to use. 0.5 per FM+PESQ paper") 
         return parser
 
-    def __init__(self, sigma_min=0.00, sigma_max =0.487, **ignored_kwargs):
+    def __init__(self, sigma_min=0.00, sigma_max =0.5, **ignored_kwargs):
         
         super().__init__()        
         self.sigma_min = sigma_min
