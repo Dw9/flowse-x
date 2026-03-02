@@ -1,3 +1,13 @@
+> ⚠️ **踩坑警告：采样率不匹配导致性能严重下降**
+>
+> VoiceBank_processed 数据集中的音频文件是 **48kHz** 采样率，但 FlowSE 模型是在 **16kHz** 频谱图上训练的（STFT 参数 `n_fft=510`, `hop_length=128` 均为 16kHz 设计）。
+>
+> `data_module.py` 的 `Specs` 数据集原本**没有做重采样**，直接在 48kHz 音频上做 STFT，导致频谱完全错误。`inference.py` 的 `evaluate_model()` 同样直接加载 48kHz 音频做推理，但 PESQ 却用 `sr=16000` 计算。
+>
+> **症状**：训练 PESQ 卡在 ~2.70（正确应 ≥3.09 baseline），评估 baseline checkpoint 只有 1.3（正确应为 3.15）。
+>
+> **修复**：在 `load_audio()` 中加入 `torchaudio.functional.resample(waveform, 48000, 16000)`，确保所有音频在进入 STFT 之前降采样到 16kHz。
+
 # FlowSE: Flow matching based speech enhancement
 
 * FlowSE: Flow Matching-based Speech Enhancement [1]

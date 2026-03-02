@@ -10,14 +10,18 @@ import torch.nn.functional as F
 import soundfile as sf
 
 
-def load_audio(filepath):
-    """Load audio using soundfile backend (more reliable than torchcodec)."""
+def load_audio(filepath, target_sr=16000):
+    """Load audio using soundfile backend and resample to target_sr."""
     waveform, sample_rate = sf.read(filepath)
     # Convert to tensor and ensure float32
     waveform = torch.from_numpy(waveform).float()
     # Ensure 2D: (channels, samples)
     if waveform.dim() == 1:
         waveform = waveform.unsqueeze(0)
+    # Resample if needed (e.g., 48kHz → 16kHz)
+    if sample_rate != target_sr:
+        waveform = torchaudio.functional.resample(waveform, sample_rate, target_sr)
+        sample_rate = target_sr
     return waveform, sample_rate
 
 

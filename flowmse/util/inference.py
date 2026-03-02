@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import torchaudio
 from pesq import pesq
 from pystoi import stoi
 import soundfile as sf
@@ -11,12 +12,15 @@ sr = 16000
 N = 5
 
 
-def load_audio(filepath):
+def load_audio(filepath, target_sr=16000):
+    """Load audio and resample to target_sr (16kHz by default)."""
     waveform, sample_rate = sf.read(filepath)
     waveform = torch.from_numpy(waveform).float()
     if waveform.dim() == 1:
         waveform = waveform.unsqueeze(0)
-    return waveform, sample_rate
+    if sample_rate != target_sr:
+        waveform = torchaudio.functional.resample(waveform, sample_rate, target_sr)
+    return waveform, target_sr
 
 
 def evaluate_model(model, num_eval_files, inference_N=N):

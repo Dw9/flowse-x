@@ -26,11 +26,10 @@ def from_flattened_numpy(x, shape):
 
 def get_white_box_solver(
     odesolver_name,  ode, VF_fn, Y, Y_prior=None,
-    T_rev=1.0, t_eps=0.03, N=30,  **kwargs
+    T_rev=1.0, t_eps=0.03, N=30, **kwargs
 ):
-   
+
     odesolver_cls = ODEsolverRegistry.get_by_name(odesolver_name)
-    
     odesolver = odesolver_cls(ode, VF_fn)
 
     def ode_solver(Y_prior=Y_prior):

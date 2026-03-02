@@ -72,6 +72,12 @@ if __name__ == "__main__":
         default=1,
         help="Number of sanity validation steps",
     )
+    parser.add_argument(
+        "--ckpt",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume training from",
+    )
 
     # Add VFModel arguments
     VFModel.add_argparse_args(
@@ -172,6 +178,21 @@ if __name__ == "__main__":
         max_epochs=args.max_epochs,
         callbacks=callbacks,
     )
+
+    # Load pretrained weights if specified (weights-only, not full resume)
+    if args.ckpt:
+        import torch as _torch
+        print(f"Loading pretrained weights from: {args.ckpt}")
+        ckpt = _torch.load(args.ckpt, map_location="cpu", weights_only=False)
+        # Load state dict (strict=False to allow new/missing keys)
+        missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)
+        if missing:
+            print(f"  Missing keys ({len(missing)}): {missing[:5]}...")
+        if unexpected:
+            print(f"  Unexpected keys ({len(unexpected)}): {unexpected[:5]}...")
+        # Load EMA via on_load_checkpoint (handles legacy format correctly)
+        model.on_load_checkpoint(ckpt)
+        print("  Pretrained weights + EMA loaded successfully!")
 
     # Train model
     trainer.fit(model)
