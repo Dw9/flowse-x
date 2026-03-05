@@ -82,125 +82,318 @@ $$
 
 It means that it does not matter that the simple distribution is located at which time point.  
 
-# Part 2: Investigating Training Objectives for Flow Matching-based Speech Enhancement
+# Part 2: DriftingSE — 基于 Drifting Models 的单步语音增强
 
-* Investigating Training Objectives for Flow Matching-based Speech Enhancement [2]
+---
 
-Based on the FlowSE framework above, we integrate perceptual (PESQ) and signal-based (SI-SDR) auxiliary losses proposed in [2] to further enhance convergence efficiency and speech quality.
+## 1. 概述
 
-## Method
+DriftingSE 将 **Drifting Models**（Deng et al., 2026, arXiv:2602.04770, Kaiming He 团队）的思想应用于语音增强任务。原始 Drifting 论文在 ImageNet 256×256 上以单步（1-NFE）生成达到 FID 1.54，其核心创新在于训练过程中让生成分布自然演化，使模型天然支持单步推理。
 
-The core idea is to add auxiliary losses that directly optimize perceptual metrics during flow matching training:
+**与 FlowSE 的关键区别：**
 
-$$
-\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CFM}} + \alpha_p \cdot \mathcal{L}_{\text{PESQ}} + \alpha_s \cdot \mathcal{L}_{\text{SI-SDR}}
-$$
-
-To compute the auxiliary losses, we need to estimate the clean speech $\hat{x}_0$ from the model's velocity prediction $v_\theta(x_t, y, t)$ at each training step, then convert it to the time domain via iSTFT and evaluate PESQ / SI-SDR against the ground truth.
-
-### Recommended hyperparameters from [2]
-
-| Training Objective | $\alpha_p$ (PESQ) | $\alpha_s$ (SI-SDR) |
+| | FlowSE (Part 1) | DriftingSE (Part 2) |
 |---|---|---|
-| Velocity prediction ($\mathcal{L}_{\text{CFM-v}}$) | 5e-2 | 5e-3 |
-| $x_1$ prediction ($\mathcal{L}_{\text{CFM-}x_1}$) | 1e-3 | 1e-4 |
-| Preconditioned $x_1$ ($\mathcal{L}_{\text{CFM-}x_1\text{-EDM}}$) | 1e-6 | 1e-7 |
+| 推理方式 | 多步 ODE 求解（默认 N=5） | **单次前向传播**（1-NFE） |
+| 训练目标 | 学习速度场 $v_\theta$，沿 ODE 轨迹积分 | 学习直接映射 noisy → clean |
+| Loss | 速度场 MSE | 混合 loss（drifting + MSE） |
+| 时间条件 | ODE 时间步 $t$ | 输入能量自适应条件 |
+| 推理速度 | ~5x backbone 前向 | **1x backbone 前向** |
 
-This codebase currently uses velocity prediction, so the defaults are $\alpha_p = 5 \times 10^{-2}$, $\alpha_s = 5 \times 10^{-3}$.
+DriftingSE 复用 FlowSE 的 NCSNpp backbone 和 STFT 数据管线，确保公平对比。
 
-## ⚠️ Critical: Time Convention Mismatch
+---
 
-**This codebase and [2] use opposite time conventions.** Directly copying formulas from [2] without adaptation will produce incorrect results.
+## 2. 方法
 
-### The two conventions
+### 2.1 Drifting Field 理论（Algorithm 2）
 
-| | This codebase (from SGMSE/Score SDE tradition) | Paper [2] (from Lipman et al. FM tradition) |
-|---|---|---|
-| $t = 0$ | Clean speech $x_0$ | Noisy speech $y$ |
-| $t = 1$ | Noisy speech $y$ | Clean speech $x_1$ |
-| $\mu_t$ | $(1-t) \cdot x_0 + t \cdot y$ | $t \cdot x_1 + (1-t) \cdot y$ |
-| $\sigma_t$ | $t \cdot \sigma_{\max}$ | $(1-t) \cdot \sigma_{\max}$ |
-| Inference | $t: 1 \to 0$ (reverse) | $t: 0 \to 1$ (forward) |
+Drifting 的核心思想：定义一个向量场 $V_{p,q}(x)$ 来衡量生成分布 $q$ 与目标分布 $p$ 之间的差异，并驱动 $q$ 向 $p$ 演化。
 
-Mathematically these are **identical** — just relabel $t \leftrightarrow (1-t)$. But formulas involving $t$ must be adapted.
+$$V_{p,q}(x) = V_p^+(x) - V_q^-(x)$$
 
-### Estimating clean speech $\hat{x}_0$ from velocity
+- $V_p^+$（正样本吸引力）：将生成样本拉向真实数据分布
+- $V_q^-$（负样本排斥力）：将生成样本推离当前生成分布
+- **反对称性保证**：当 $q = p$ 时 $V = 0$（平衡态），loss 自然归零
 
-In **[2]'s convention** (t=0 noisy, t=1 clean):
-$$
-\hat{x}_1 = x_t + (1-t) \cdot v_\theta(x_t, y, t)
-$$
+具体计算过程（`compute_drifting_field()`）：
 
-In **this codebase's convention** (t=0 clean, t=1 noisy):
-$$
-\hat{x}_0 = x_t - t \cdot v_\theta(x_t, y, t)
-$$
+1. 计算生成样本 $x$ 与正样本 $y_{pos}$（clean）、负样本 $y_{neg}$（generated）之间的 L2 距离
+2. 应用 softmax kernel：$\text{logit} = -\text{dist} / \tau$，对正负样本联合归一化
+3. 双向归一化：$A = \sqrt{A_{row} \cdot A_{col}}$（行归一化 × 列归一化的几何平均）
+4. 计算加权 drift 向量：$V = W_{pos} \cdot y_{pos} - W_{neg} \cdot y_{neg}$
+5. 负样本采用 self-negative 策略（$y_{neg} = x$），对角线 mask 避免自排斥
 
-### Derivation (this codebase)
+**Drifting Loss**：
 
-Given (with $\sigma_{\min} = 0$):
+$$L_{drift} = \| \phi(x) - \text{sg}(\phi(x) + V) \|^2$$
 
-$$
-x_t = (1-t) \cdot x_0 + t \cdot y + t \cdot \sigma_{\max} \cdot z
-$$
-$$
-\text{condVF} = (y - x_0) + \sigma_{\max} \cdot z
-$$
+其中 $\phi$ 为多尺度特征提取器，$\text{sg}$ 为 stop-gradient。梯度只通过 $\phi(x)$ 流向生成器，目标 $\phi(x) + V$ 被冻结。
 
-Verify $x_t - t \cdot \text{condVF}$:
+### 2.2 混合 Loss
 
-$$
-\begin{aligned}
-&\quad [(1-t) x_0 + t \cdot y + t \sigma_{\max} z] - t \cdot [(y - x_0) + \sigma_{\max} z] \\
-&= (1-t) x_0 + t \cdot y + t \sigma_{\max} z - t \cdot y + t \cdot x_0 - t \sigma_{\max} z \\
-&= (1-t) x_0 + t \cdot x_0 \\
-&= x_0 \quad \checkmark
-\end{aligned}
-$$
+$$L_{total} = \lambda_{drift} \cdot L_{drift} + \lambda_{recon} \cdot L_{recon}$$
 
-### What goes wrong with the naive formula
+- **$L_{drift}$**（分布匹配）：多尺度 drifting loss，驱动输出分布整体对齐到 clean 分布
+- **$L_{recon}$**（逐样本保真）：$\text{mean}(|x_{hat} - x_{clean}|^2)$，确保每条语音的细节还原
 
-| Formula | Result | Correct? |
-|---|---|---|
-| $x_t + (1-t) \cdot v_\theta$ (paper [2] formula, wrong here) | $y + \sigma_{\max} z$ | ❌ noisy + extra noise |
-| $y - v_\theta$ (simplified, ignoring $\sigma_{\max}$) | $x_0 - \sigma_{\max} z$ | ❌ clean + residual noise |
-| $x_t - t \cdot v_\theta$ **(correct for this codebase)** | $x_0$ | ✅ exact recovery |
+两者互补：drift 提供全局分布正则化，MSE 保证逐样本精度。
 
-## Training with auxiliary losses
+### 2.3 残差学习
+
+$$\hat{x} = y + \text{backbone}(y, \epsilon)$$
+
+backbone 初始化时输出接近零，因此 $\hat{x} \approx y$，这是语音增强的合理起点（带噪语音本身包含大部分干净信号）。模型只需学习预测残差（噪声），而非从头生成完整频谱。
+
+### 2.4 能量自适应条件（Energy-Adaptive Conditioning）
+
+NCSNpp 原本使用 ODE 时间步 $t$ 通过 Fourier embedding 和 FiLM 层调制 backbone。DriftingSE 中没有 ODE 时间步，取而代之的是：
+
+$$t = \sigma\left(\log\left(\text{mean}(|y|)\right)\right)$$
+
+其中 $\sigma$ 为 sigmoid 函数，$|y|$ 为输入频谱的幅度。
+
+**效果**：不同噪声水平的输入产生不同的 $t$ 值，NCSNpp 的 16 个 ResNet block 通过 FiLM 层得到不同的调制，从而自适应地处理不同噪声条件。
+
+### 2.5 多尺度特征提取
+
+DriftingSE 的 drifting loss 在多尺度特征空间上计算，包含两大类共 14 个尺度：
+
+**原始频谱特征（7 个尺度）**，由 `extract_multiscale_features()` 提取：
+
+| 尺度 | 描述 | 维度 |
+|------|------|------|
+| (a) 全局统计 | mean/std over F×T | $[B, 2C]$ |
+| (b) 频率维均值 | mean over T per freq | $[B, C \times F]$ |
+| (c) 频率维方差 | std over T per freq | $[B, C \times F]$ |
+| (d) 时间维均值 | mean over F per frame | $[B, C \times T]$ |
+| (e) 时间维方差 | std over F per frame | $[B, C \times T]$ |
+| (f) 4×4 patch 均值 | local patch statistics | $[B, C \times (F/4) \times (T/4)]$ |
+| (g) 能量统计 | mean of squared values | $[B, C]$ |
+
+**Mel 频谱特征（7 个尺度）**，由 `extract_mel_features()` 提取：
+
+| 尺度 | 描述 | 维度 |
+|------|------|------|
+| (a) Band 均值 | log-mel per-band mean | $[B, n_{mels}]$ |
+| (b) Band 方差 | log-mel per-band std | $[B, n_{mels}]$ |
+| (c) Frame 能量 | log-mel per-frame mean | $[B, T]$ |
+| (d) Frame 方差 | log-mel per-frame std | $[B, T]$ |
+| (e) Mel patch 统计 | 4×4 mel patch mean | $[B, (n_{mels}/4) \times (T/4)]$ |
+| (f) Delta 均值 | temporal change per band | $[B, n_{mels}]$ |
+| (g) Delta 方差 | temporal variability | $[B, n_{mels}]$ |
+
+Mel 特征路径：$|\text{spec}| \to \text{mel filterbank} \to \log\text{-mel} \to$ 各种统计量。全程在 STFT 域完成，无需 ISTFT。
+
+每个尺度的特征先做 Section A.6 归一化（使平均距离 $\approx \sqrt{D}$），再分别计算 drifting loss，最后取所有尺度的平均。
+
+### 2.6 FeatureBank：正样本增广
+
+`FeatureBank` 是一个环形缓冲区（ring buffer），在训练中存储历史 batch 的 clean 特征。
+
+- **容量**：`max_size=256`（默认），每个 DDP 进程独立维护
+- **存储**：仅存储正样本（clean 特征），因其不依赖模型，不会过时
+- **用途**：增广 drifting loss 中的正样本集合，使分布估计更准确
+- **内存**：约 12MB，存储在 CPU 上以节省 GPU 显存
+
+---
+
+## 3. 训练指标说明
+
+### 核心 Loss（每个均有 step 和 epoch 两个粒度）
+
+| 指标 | 含义 | 正常范围 |
+|------|------|----------|
+| `drift_loss` | $\|\|V\|\|^2$ — drifting 向量的平方模长。生成分布与 clean 分布越远越大，完全对齐时为 0 | 训练初期 ~10+，逐渐下降 |
+| `recon_loss` | $\text{mean}(\|x_{hat} - x_{clean}\|^2)$ — 逐样本 MSE 重建损失 | ~0.002 量级 |
+| `train_loss` | $\lambda_{drift} \times \text{drift} + \lambda_{recon} \times \text{recon}$ — 加权总 loss | 取决于各权重 |
+| `valid_loss` | 同 train_loss，但使用 EMA 权重在验证集上计算 | 应略低于 train_loss |
+
+### 监控指标
+
+| 指标 | 含义 | 用途 |
+|------|------|------|
+| `drift_recon_ratio` | $\text{drift\_loss} / \text{recon\_loss}$ | 观察哪个 loss 主导训练。比值过大说明 drift 主导，可能需要降低 drift_weight |
+| `drift_v_magnitude` | $\|\|V\|\|$（非平方），drifting 向量的实际大小 | 跟踪收敛状态。训练过程中应逐渐下降，收敛时趋近于 0 |
+| `pesq` | 宽带 PESQ（16kHz），语音质量的客观指标 | 核心评价指标，越高越好（1.0~4.5） |
+| `si_sdr` | Scale-Invariant Signal-to-Distortion Ratio (dB) | 信号失真度，越高越好 |
+| `estoi` | Extended Short-Time Objective Intelligibility | 语音可懂度，越高越好（0~1） |
+
+---
+
+## 4. 关键超参数
+
+| 超参数 | 默认值 | 说明 |
+|--------|--------|------|
+| `--drift_weight` | **0.008**（推荐） | drifting loss 的权重。通过梯度范数分析确定：drift/recon 梯度比约为 260:1，因此需要很小的 drift_weight 来平衡梯度。dw=0.004 使梯度均衡，dw=0.008（drift 梯度约 2 倍于 recon）效果最佳 |
+| `--recon_weight` | 1.0 | MSE 重建 loss 的权重 |
+| `--loss_type` | `hybrid` | 可选 `hybrid`（推荐）/ `drifting`（纯 drifting）/ `mse`（纯 MSE baseline） |
+| `--accumulate_grad_batches` | 4 | 梯度累积步数。有效 batch = batch_size × GPU 数 × 4 |
+| `--bank_size` | 256 | FeatureBank 容量。设为 0 禁用 |
+| `--temperatures` | `0.02,0.05,0.2` | softmax kernel 的温度值。每个温度独立计算 drift 向量后累加。低温关注近邻，高温关注全局结构 |
+| `--energy_conditioning` | 1 | 是否使用能量自适应条件。1 = 启用，0 = 固定 t=1.0 |
+| `--use_residual` | 1 | 是否使用残差学习。1 = $\hat{x} = y + \text{backbone}$，0 = $\hat{x} = \text{backbone}$ |
+| `--use_mel_features` | 1 | 是否在 drifting loss 中使用 mel 特征（14 尺度 vs 仅 7 尺度） |
+| `--n_mels` | 80 | mel 滤波器组的频带数 |
+| `--ema_decay` | 0.999 | EMA 权重的指数衰减系数 |
+| `--lr` | 1e-4 | 学习率（Adam 优化器） |
+
+---
+
+## 5. 实验结果
+
+在 VoiceBank 数据集上的实验（约 115 epochs，验证集评估）：
+
+| 配置 | PESQ (peak) | SI-SDR | recon_loss (val) | 说明 |
+|------|:-----------:|:------:|:----------------:|------|
+| A2: MSE baseline | 2.10 | 15.97→9.1 | 0.0026 | ep132 后训练崩溃 |
+| B2: hybrid dw=0.004 | 2.09 | 14.65 ↑ | 0.0023 | 梯度均衡点 |
+| **B3: hybrid dw=0.008** | **2.17** | **14.77** ↑ | **0.0019** | drift 梯度约 2 倍于 recon |
+| C1: hybrid dw=0.01 | 2.10 / 2.29 (test) | 15.75 (test) | — | 完整 test set 评估 |
+
+### 关键发现
+
+1. **Drifting loss 确实有效**：B3 (hybrid) 在 PESQ 上优于 A2 (pure MSE)，同时 recon_loss 更低
+2. **正则化效果**：drift loss 防止了纯 MSE 训练的崩溃（A2 在 ep132 后 SI-SDR 从 15.97 骤降至 9.1）
+3. **梯度平衡是关键**：原始 drift/recon 梯度比为 ~260:1，需要小 drift_weight 来平衡。最佳点在 drift 梯度略大于 recon 梯度时（dw=0.008）
+4. **单步推理**：所有 DriftingSE 实验均为 1-NFE（单次前向传播），推理速度约为 FlowSE（N=5）的 5 倍
+
+---
+
+## 6. 训练与评估命令
+
+### 训练
 
 ```bash
-python train.py --base_dir <your_dataset_dir> \
-    --use_pesq_loss --use_si_sdr_loss \
-    --alpha_pesq 5e-2 --alpha_si_sdr 5e-3
+# 混合 loss（推荐配置）：drift_weight=0.008
+python train_drifting.py \
+    --base_dir /path/to/VoiceBank_processed \
+    --loss_type hybrid \
+    --drift_weight 0.008 \
+    --no_wandb
+
+# 纯 MSE baseline（对照实验）
+python train_drifting.py \
+    --base_dir /path/to/VoiceBank_processed \
+    --loss_type mse \
+    --no_wandb
+
+# 纯 drifting loss（实验性质）
+python train_drifting.py \
+    --base_dir /path/to/VoiceBank_processed \
+    --loss_type drifting \
+    --drift_weight 1.0 \
+    --no_wandb
+
+# 从预训练权重初始化（例如 FlowSE checkpoint）
+python train_drifting.py \
+    --base_dir /path/to/VoiceBank_processed \
+    --loss_type hybrid \
+    --drift_weight 0.008 \
+    --ckpt /path/to/pretrained.ckpt \
+    --no_wandb
+
+# 使用 W&B 日志（去掉 --no_wandb，项目名为 DRIFTING-SE）
+python train_drifting.py \
+    --base_dir /path/to/VoiceBank_processed \
+    --loss_type hybrid \
+    --drift_weight 0.008
 ```
 
-You can also enable only one of the two:
+### 评估
 
 ```bash
-# PESQ loss only
-python train.py --base_dir <your_dataset_dir> --use_pesq_loss --alpha_pesq 5e-2
+# 在测试集上评估（单步推理，1-NFE）
+python eval_drifting.py \
+    --checkpoint /path/to/checkpoint.ckpt \
+    --data_dir /path/to/VoiceBank_processed \
+    --split test
 
-# SI-SDR loss only
-python train.py --base_dir <your_dataset_dir> --use_si_sdr_loss --alpha_si_sdr 5e-3
+# 评估并保存增强后的音频
+python eval_drifting.py \
+    --checkpoint /path/to/checkpoint.ckpt \
+    --data_dir /path/to/VoiceBank_processed \
+    --split test \
+    --output_dir /path/to/output
 ```
 
-### Additional dependency
+### Checkpoint 保存策略
 
-PESQ loss requires the differentiable [torch-pesq](https://github.com/audiolabs/torch-pesq) package:
+训练过程自动保存三类 checkpoint：
+- `{epoch}_last.ckpt`：最新一轮
+- `{epoch}_{pesq:.2f}.ckpt`：PESQ 最高的 top-20
+- `{epoch}_{si_sdr:.2f}.ckpt`：SI-SDR 最高的 top-20
 
-```bash
-pip install torch-pesq
+保存路径：`logs/drifting_<dataset>_<loss_type>_dw<weight>_<KST_timestamp>/`
+
+---
+
+## 7. Loss 修复历史
+
+在初始实现中发现了三个关键 bug（2026-03-03 修复），记录如下以供参考：
+
+### Bug 1: `normalize_drift` 导致 drift_loss 恒为常数
+
+**问题**：原始实现中对 drift 向量 $V$ 做了归一化 ($V / \lambda$, $\lambda = \sqrt{E[\|V\|^2/D]}$)，导致 drifting loss 始终等于 14.0（= 特征尺度数），完全丧失了梯度信号。
+
+**原因**：归一化后 $\|V/\lambda\|^2 / D \equiv 1$，MSE loss $\|x - (x + V/\lambda)\|^2 = \|V/\lambda\|^2$ 恒定。
+
+**修复**：移除 `normalize_drift`，让 $V \to 0$ 在平衡态时自然给出 loss $\to 0$ 的正确信号。
+
+### Bug 2: recon_loss 使用 sum reduction 导致 260 倍梯度不匹配
+
+**问题**：`_reconstruction_loss` 使用了 `torch.sum()` 而非 `torch.mean()`，导致其梯度量级约为 drift_loss 的 260 倍（$\approx 2 \times F \times T / B = 2 \times 256 \times 256 / 4$）。
+
+**修复**：改为 `torch.mean(torch.square(err.abs()))`，使两个 loss 的梯度在同一量级。
+
+### Bug 3: 小 batch 下 drifting loss 估计不稳定
+
+**问题**：batch_size=4 时，drifting loss 的正/负样本太少，分布估计方差大。
+
+**修复**：
+- 添加 `accumulate_grad_batches=4`（默认值），在不增加显存的前提下将有效 batch 扩大 4 倍
+- 添加 `FeatureBank`（环形缓冲区，max_size=256），存储历史 clean 特征增广正样本集合
+- drift_loss 从各尺度求和改为求均值，使 loss 量级不随特征尺度数变化
+
+---
+
+## 8. 代码结构
+
+```
+flowmse/
+├── drifting.py            # 核心 drifting field 计算
+│                          #   - FeatureBank: 正样本特征环形缓冲区
+│                          #   - compute_drifting_field(): Algorithm 2 实现
+│                          #   - normalize_features(): Section A.6 特征归一化
+│                          #   - drifting_loss_single_scale(): 单尺度 drifting loss
+│                          #   - create_mel_filterbank(): mel 滤波器组
+│                          #   - extract_mel_features(): mel 频谱特征（7 尺度）
+│                          #   - extract_multiscale_features(): 原始+mel 特征（14 尺度）
+│                          #   - compute_drifting_loss(): 多尺度 drifting loss 入口
+│
+├── drifting_model.py      # DriftingSEModel (PyTorch Lightning module)
+│                          #   - 单步前向传播：x_hat = y + backbone(y, ε)
+│                          #   - 能量自适应条件：t = sigmoid(log(mean(|y|)))
+│                          #   - 混合 loss 计算与日志记录
+│                          #   - 手动 EMA 权重管理
+│                          #   - 验证时 PESQ/SI-SDR/ESTOI 评估
+│
+├── backbones/
+│   └── ncsnpp.py          # NCSNpp U-Net backbone（与 FlowSE 共享）
+│                          #   FiLM 条件由时间步改为输入能量驱动
+│
+├── data_module.py         # 数据加载（STFT、重采样等，与 FlowSE 共享）
+│
+train_drifting.py          # 训练脚本
+│                          #   - 支持 hybrid / drifting / mse 三种 loss 模式
+│                          #   - 默认梯度累积 4 步
+│                          #   - TensorBoard 或 W&B 日志
+│                          #   - 支持从预训练 checkpoint 初始化
+│
+eval_drifting.py           # 评估脚本
+                           #   - 单步推理（1-NFE），无需 ODE 求解
+                           #   - 输出 PESQ / SI-SDR / ESTOI
+                           #   - 可选保存增强后音频
 ```
 
-## Implementation
-
-The auxiliary loss implementation lives in:
-
-- `flowmse/losses.py` — SI-SDR loss function and `estimate_x0_from_velocity`
-- `flowmse/model.py` — Integration into the training loop (`_step` method)
-
-## References
-
-- [1] S. Lee, S. Cheong, S. Han, J. W. Shin, "FlowSE: Flow Matching-based Speech Enhancement," *ICASSP 2025*. [arXiv:2508.06840](https://arxiv.org/abs/2508.06840)
-- [2] L. Yang, Z. Ge, G. Zhang, J. Zhang, Z. Wu, "Investigating Training Objectives for Flow Matching-based Speech Enhancement," *arXiv 2025*. [arXiv:2512.10382](https://arxiv.org/abs/2512.10382)
-
+**与 FlowSE 的代码关系**：DriftingSE 的代码完全独立于 FlowSE 的训练/推理流程（`model.py`, `train.py`, `evaluate.py`）。两者共享 backbone（`ncsnpp.py`）、数据管线（`data_module.py`）和工具函数（`util/`），但互不影响。

@@ -15,6 +15,58 @@ import torch
 import torch.nn.functional as F
 
 
+class FeatureBank:
+    """
+    Ring buffer storing clean speech features for augmenting positive samples.
+
+    Only stores positive (clean) features — these don't depend on the model,
+    so they never go stale. Each DDP process maintains its own bank.
+
+    Memory: ~12MB for max_size=256 with typical feature dimensions.
+    """
+
+    def __init__(self, max_size=256):
+        self.max_size = max_size
+        self.banks = {}   # scale_idx → list of [B, D] tensors on CPU
+        self.counts = {}  # scale_idx → total samples stored
+
+    def update(self, features):
+        """
+        Add a batch of clean features to the bank.
+
+        Args:
+            features: list of [B, D_j] feature tensors (one per scale)
+        """
+        for scale_idx, feat in enumerate(features):
+            if scale_idx not in self.banks:
+                self.banks[scale_idx] = []
+                self.counts[scale_idx] = 0
+
+            # Store on CPU to save GPU memory
+            self.banks[scale_idx].append(feat.detach().cpu())
+            self.counts[scale_idx] += feat.shape[0]
+
+            # Evict oldest if over capacity
+            while self.counts[scale_idx] > self.max_size:
+                removed = self.banks[scale_idx].pop(0)
+                self.counts[scale_idx] -= removed.shape[0]
+
+    def get(self, scale_idx, device):
+        """
+        Get all stored features for a given scale.
+
+        Args:
+            scale_idx: which feature scale
+            device: target device for the returned tensor
+
+        Returns:
+            [N_bank, D] tensor or None if empty
+        """
+        if scale_idx not in self.banks or not self.banks[scale_idx]:
+            return None
+        return torch.cat(self.banks[scale_idx], dim=0).to(device)
+
+
 def compute_drifting_field(x, y_pos, y_neg, temperature, self_neg=True):
     """
     Compute drifting field V following Algorithm 2 of the Drifting paper.
@@ -147,16 +199,17 @@ def drifting_loss_single_scale(x_feat, pos_feat, neg_feat,
             )
         V_total = V_total + V_tau
 
-    # Drift normalization (Section A.6)
-    drift_scale = normalize_drift(V_total)
-    V_normalized = V_total / (drift_scale + 1e-8)
-
     # Drifting loss: ||φ(x) - stopgrad(φ(x) + V)||²
+    # No drift normalization — V→0 at equilibrium gives loss→0 (correct signal)
     # Gradient flows through x_norm (→ generator), target is frozen
-    target = (x_norm + V_normalized).detach()
+    target = (x_norm + V_total).detach()
     loss = F.mse_loss(x_norm, target)
 
-    return loss
+    # Monitor V magnitude (detached)
+    with torch.no_grad():
+        v_sq = (V_total ** 2).sum(dim=-1).mean().item() / D
+
+    return loss, v_sq
 
 
 def create_mel_filterbank(n_freqs, sr=16000, n_mels=80, fmin=0.0, fmax=None):
@@ -305,7 +358,7 @@ def extract_multiscale_features(spec, mel_fb=None):
 
 
 def compute_drifting_loss(x_hat_spec, x_clean_spec, temperatures=(0.02, 0.05, 0.2),
-                          mel_fb=None):
+                          mel_fb=None, feature_bank=None):
     """
     Compute multi-scale drifting loss between generated and real spectrograms.
 
@@ -314,9 +367,11 @@ def compute_drifting_loss(x_hat_spec, x_clean_spec, temperatures=(0.02, 0.05, 0.
         x_clean_spec: [B, 2, F, T] real clean spectrogram (detached)
         temperatures: tuple of temperature values for kernel
         mel_fb: [F, n_mels] optional mel filterbank for perceptual features
+        feature_bank: optional FeatureBank for augmenting positive samples
 
     Returns:
-        loss: scalar total drifting loss (sum over all scales)
+        loss: scalar total drifting loss (mean over all scales)
+        v_mag: scalar average V magnitude (detached, for monitoring)
     """
     # Extract multi-scale features
     x_hat_feats = extract_multiscale_features(x_hat_spec, mel_fb=mel_fb)
@@ -324,16 +379,34 @@ def compute_drifting_loss(x_hat_spec, x_clean_spec, temperatures=(0.02, 0.05, 0.
     with torch.no_grad():
         x_clean_feats = extract_multiscale_features(x_clean_spec, mel_fb=mel_fb)
 
+    # Update feature bank with current clean features (if enabled)
+    if feature_bank is not None:
+        feature_bank.update(x_clean_feats)
+
     # Compute drifting loss per scale and sum
     total_loss = torch.tensor(0.0, device=x_hat_spec.device)
-    for x_feat, pos_feat in zip(x_hat_feats, x_clean_feats):
+    total_v_sq = 0.0
+    n_scales = 0
+    for scale_idx, (x_feat, pos_feat) in enumerate(zip(x_hat_feats, x_clean_feats)):
+        # Augment positive samples from feature bank
+        if feature_bank is not None:
+            banked = feature_bank.get(scale_idx, device=x_feat.device)
+            if banked is not None:
+                pos_feat = torch.cat([pos_feat, banked], dim=0)
+
         # Negative samples = generated samples (self-negative)
         neg_feat = x_feat.detach()
-        loss_j = drifting_loss_single_scale(
+        loss_j, v_sq_j = drifting_loss_single_scale(
             x_feat, pos_feat, neg_feat,
             temperatures=temperatures,
             self_neg=True
         )
         total_loss = total_loss + loss_j
+        total_v_sq += v_sq_j
+        n_scales += 1
 
-    return total_loss
+    # Average over scales (not sum) to keep loss magnitude independent of num scales
+    avg_loss = total_loss / max(n_scales, 1)
+    avg_v_mag = (total_v_sq / max(n_scales, 1)) ** 0.5
+
+    return avg_loss, avg_v_mag

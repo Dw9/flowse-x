@@ -66,6 +66,8 @@ if __name__ == "__main__":
     parser.add_argument("--accelerator", type=str, default="gpu")
     parser.add_argument("--log_every_n_steps", type=int, default=10)
     parser.add_argument("--num_sanity_val_steps", type=int, default=1)
+    parser.add_argument("--accumulate_grad_batches", type=int, default=4,
+                        help="Gradient accumulation steps (effective_batch = batch * gpus * this)")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Path to checkpoint for weight initialization")
 
@@ -104,7 +106,8 @@ if __name__ == "__main__":
     )
 
     # Logger
-    name_save_dir_path = f"drifting_{dataset}_{args.loss_type}_{formatted_time_kst}"
+    dw_tag = f"_dw{args.drift_weight}" if args.loss_type != "mse" else ""
+    name_save_dir_path = f"drifting_{dataset}_{args.loss_type}{dw_tag}_{formatted_time_kst}"
 
     if args.no_wandb:
         logger = TensorBoardLogger(save_dir="logs", name=name_save_dir_path)
@@ -147,6 +150,7 @@ if __name__ == "__main__":
         log_every_n_steps=args.log_every_n_steps,
         num_sanity_val_steps=args.num_sanity_val_steps,
         max_epochs=args.max_epochs,
+        accumulate_grad_batches=args.accumulate_grad_batches,
         callbacks=callbacks,
     )
 

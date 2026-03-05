@@ -35,7 +35,9 @@ def evaluate(args):
 
     # Load model
     print(f"Loading checkpoint: {args.checkpoint}")
-    model = DriftingSEModel.load_from_checkpoint(args.checkpoint, map_location="cpu")
+    model = DriftingSEModel.load_from_checkpoint(
+        args.checkpoint, map_location="cpu", weights_only=False
+    )
     model.eval()
     model.cuda()
 

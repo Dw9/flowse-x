@@ -19,7 +19,7 @@ import torch
 import pytorch_lightning as pl
 
 from flowmse.backbones import BackboneRegistry
-from flowmse.drifting import compute_drifting_loss, create_mel_filterbank
+from flowmse.drifting import compute_drifting_loss, create_mel_filterbank, FeatureBank
 from flowmse.util.other import si_sdr, pad_spec
 
 # Lazy import for evaluation
@@ -74,6 +74,8 @@ class DriftingSEModel(pl.LightningModule):
                             help="Number of mel bands for mel features")
         parser.add_argument("--energy_conditioning", type=int, default=1,
                             help="Use input energy as conditioning (1) or fixed t=1.0 (0)")
+        parser.add_argument("--bank_size", type=int, default=256,
+                            help="Feature memory bank size for positive samples (0=disabled)")
         # Compatibility with evaluate flow (t_eps, T_rev unused but kept for interface)
         parser.add_argument("--t_eps", type=float, default=0.03)
         parser.add_argument("--T_rev", type=float, default=1.0)
@@ -96,6 +98,7 @@ class DriftingSEModel(pl.LightningModule):
         use_mel_features=1,
         n_mels=80,
         energy_conditioning=1,
+        bank_size=256,
         t_eps=0.03,
         T_rev=1.0,
         loss_abs_exponent=0.5,
@@ -139,6 +142,13 @@ class DriftingSEModel(pl.LightningModule):
         self.ema_dnn = {}
         for name, param in self.dnn.named_parameters():
             self.ema_dnn[name] = param.data.clone()
+
+        # Feature memory bank for positive samples (clean features)
+        self.bank_size = bank_size
+        if bank_size > 0 and loss_type != "mse":
+            self.feature_bank = FeatureBank(max_size=bank_size)
+        else:
+            self.feature_bank = None
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.dnn.parameters(), lr=self.lr)
@@ -259,10 +269,9 @@ class DriftingSEModel(pl.LightningModule):
         return torch.cat([spec.real, spec.imag], dim=1)
 
     def _reconstruction_loss(self, x_hat, x_clean):
-        """MSE reconstruction loss (same as FlowSE)."""
+        """MSE reconstruction loss with mean reduction (matches drift loss scale)."""
         err = x_hat - x_clean
-        losses = torch.square(err.abs())
-        loss = torch.mean(0.5 * torch.sum(losses.reshape(losses.shape[0], -1), dim=-1))
+        loss = torch.mean(torch.square(err.abs()))
         return loss
 
     def _step(self, batch, batch_idx):
@@ -282,10 +291,11 @@ class DriftingSEModel(pl.LightningModule):
         x_clean_real = self._spec_to_real(x0)
 
         # Drifting loss (distribution matching)
-        loss_drift = compute_drifting_loss(
+        loss_drift, v_mag = compute_drifting_loss(
             x_hat_real, x_clean_real.detach(),
             temperatures=self.temperatures,
             mel_fb=self.mel_fb,
+            feature_bank=self.feature_bank if self.training else None,
         )
 
         if self.loss_type == "hybrid":
@@ -293,10 +303,16 @@ class DriftingSEModel(pl.LightningModule):
             loss = self.drift_weight * loss_drift + self.recon_weight * loss_recon
             self.log("drift_loss", loss_drift, on_step=True, on_epoch=True)
             self.log("recon_loss", loss_recon, on_step=True, on_epoch=True)
+            # Monitoring: ratio and V magnitude
+            with torch.no_grad():
+                ratio = loss_drift / (loss_recon + 1e-8)
+            self.log("drift_recon_ratio", ratio, on_step=True, on_epoch=True)
         else:
             # Pure drifting loss
             loss = self.drift_weight * loss_drift
             self.log("drift_loss", loss_drift, on_step=True, on_epoch=True)
+
+        self.log("drift_v_magnitude", v_mag, on_step=True, on_epoch=True)
 
         return loss
 

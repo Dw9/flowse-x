@@ -56,10 +56,6 @@ if __name__ == '__main__':
     N = args.N
     N_mid = args.N_mid
    
-
-
-
-
     # Load vector field model
     model = VFModel.load_from_checkpoint(
         checkpoint_file, base_dir="",
