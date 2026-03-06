@@ -90,6 +90,11 @@ class DriftingSEModel(pl.LightningModule):
                             help="Total epoch budget for cosine schedule (including warmup)")
         parser.add_argument("--lr_min", type=float, default=1e-6,
                             help="Minimum learning rate at end of cosine decay")
+        # Multi-resolution STFT loss
+        parser.add_argument("--use_mr_stft", type=int, default=1,
+                            help="Use multi-resolution STFT loss (1=yes, 0=no)")
+        parser.add_argument("--mr_stft_weight", type=float, default=0.01,
+                            help="Weight for multi-resolution STFT loss")
         # Compatibility with evaluate flow (t_eps, T_rev unused but kept for interface)
         parser.add_argument("--t_eps", type=float, default=0.03)
         parser.add_argument("--T_rev", type=float, default=1.0)
@@ -118,6 +123,8 @@ class DriftingSEModel(pl.LightningModule):
         warmup_epochs=5,
         lr_t_max=300,
         lr_min=1e-6,
+        use_mr_stft=1,
+        mr_stft_weight=0.01,
         t_eps=0.03,
         T_rev=1.0,
         loss_abs_exponent=0.5,
@@ -147,6 +154,8 @@ class DriftingSEModel(pl.LightningModule):
         self.warmup_epochs = warmup_epochs
         self.lr_t_max = lr_t_max
         self.lr_min = lr_min
+        self.use_mr_stft = bool(use_mr_stft)
+        self.mr_stft_weight = mr_stft_weight
         self.t_eps = t_eps
         self.T_rev = T_rev
         self._error_loading_ema = False
@@ -173,6 +182,11 @@ class DriftingSEModel(pl.LightningModule):
             self.feature_bank = FeatureBank(max_size=bank_size)
         else:
             self.feature_bank = None
+
+        # Multi-resolution STFT loss (waveform-domain supervision)
+        if self.use_mr_stft:
+            from flowmse.losses import MultiResolutionSTFTLoss
+            self.mr_stft_loss_fn = MultiResolutionSTFTLoss()
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.dnn.parameters(), lr=self.lr)
@@ -333,10 +347,26 @@ class DriftingSEModel(pl.LightningModule):
         # Single-step generation
         x_hat = self.forward(y)
 
+        # Multi-resolution STFT loss (waveform domain)
+        mr_loss = None
+        if self.use_mr_stft:
+            wav_length = (x0.shape[-1] - 1) * self.data_module.hop_length
+            x_hat_wav = self._istft(
+                self._backward_transform(x_hat).squeeze(1), wav_length
+            )
+            with torch.no_grad():
+                x0_wav = self._istft(
+                    self._backward_transform(x0).squeeze(1), wav_length
+                )
+            mr_loss = self.mr_stft_loss_fn(x_hat_wav, x0_wav)
+            self.log("mr_stft_loss", mr_loss, on_step=True, on_epoch=True)
+
         if self.loss_type == "mse":
             # Pure MSE baseline (no drifting)
             loss = self._reconstruction_loss(x_hat, x0)
             self.log("recon_loss", loss, on_step=True, on_epoch=True)
+            if mr_loss is not None:
+                loss = loss + self.mr_stft_weight * mr_loss
             return loss
 
         # Convert to real tensors for drifting loss computation
@@ -354,6 +384,8 @@ class DriftingSEModel(pl.LightningModule):
         if self.loss_type == "hybrid":
             loss_recon = self._reconstruction_loss(x_hat, x0)
             loss = self.drift_weight * loss_drift + self.recon_weight * loss_recon
+            if mr_loss is not None:
+                loss = loss + self.mr_stft_weight * mr_loss
             self.log("drift_loss", loss_drift, on_step=True, on_epoch=True)
             self.log("recon_loss", loss_recon, on_step=True, on_epoch=True)
             # Monitoring: ratio and V magnitude
@@ -363,6 +395,8 @@ class DriftingSEModel(pl.LightningModule):
         else:
             # Pure drifting loss
             loss = self.drift_weight * loss_drift
+            if mr_loss is not None:
+                loss = loss + self.mr_stft_weight * mr_loss
             self.log("drift_loss", loss_drift, on_step=True, on_epoch=True)
 
         self.log("drift_v_magnitude", v_mag, on_step=True, on_epoch=True)
