@@ -22,4 +22,15 @@ fowse*
 flowse*
 WSJ0*/
 WSJ0*
-*.wav*.ckpt
+*.wav
+
+# Model files
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.bin
+*.h5
+*.pb
+*.tflite
