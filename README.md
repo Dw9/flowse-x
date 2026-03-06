@@ -102,6 +102,18 @@ DriftingSE 将 **Drifting Models**（Deng et al., 2026, arXiv:2602.04770, Kaimin
 
 DriftingSE 复用 FlowSE 的 NCSNpp backbone 和 STFT 数据管线，确保公平对比。
 
+ 唯一的语义差异
+
+  ┌──────────┬─────────────────────────┬─────────────────────────────────┐
+  │          │         FlowSE          │           DriftingSE            │
+  ├──────────┼─────────────────────────┼─────────────────────────────────┤
+  │ 输入 t   │ 随机采样 t ∈ [0,1]（ODE │ sigmoid(log_energy)（输入能量） │
+  │          │  时间步）               │                                 │
+  ├──────────┼─────────────────────────┼─────────────────────────────────┤
+  │ 输出含义 │ 速度场 v(x_t, y,        │ 直接估计 x̂ = y + backbone(y, 0) │
+  │          │ t)（ODE 梯度方向）      │                                 │
+  ├──────────┼─────────────────────────┼─────────────────────────────────┤
+  │ 任务     │ 预测如何从 x_t 移向 x_0 │ 直接从 y 预测 x_0      
 ---
 
 ## 2. 方法
@@ -328,36 +340,7 @@ python eval_drifting.py \
 
 ---
 
-## 7. Loss 修复历史
-
-在初始实现中发现了三个关键 bug（2026-03-03 修复），记录如下以供参考：
-
-### Bug 1: `normalize_drift` 导致 drift_loss 恒为常数
-
-**问题**：原始实现中对 drift 向量 $V$ 做了归一化 ($V / \lambda$, $\lambda = \sqrt{E[\|V\|^2/D]}$)，导致 drifting loss 始终等于 14.0（= 特征尺度数），完全丧失了梯度信号。
-
-**原因**：归一化后 $\|V/\lambda\|^2 / D \equiv 1$，MSE loss $\|x - (x + V/\lambda)\|^2 = \|V/\lambda\|^2$ 恒定。
-
-**修复**：移除 `normalize_drift`，让 $V \to 0$ 在平衡态时自然给出 loss $\to 0$ 的正确信号。
-
-### Bug 2: recon_loss 使用 sum reduction 导致 260 倍梯度不匹配
-
-**问题**：`_reconstruction_loss` 使用了 `torch.sum()` 而非 `torch.mean()`，导致其梯度量级约为 drift_loss 的 260 倍（$\approx 2 \times F \times T / B = 2 \times 256 \times 256 / 4$）。
-
-**修复**：改为 `torch.mean(torch.square(err.abs()))`，使两个 loss 的梯度在同一量级。
-
-### Bug 3: 小 batch 下 drifting loss 估计不稳定
-
-**问题**：batch_size=4 时，drifting loss 的正/负样本太少，分布估计方差大。
-
-**修复**：
-- 添加 `accumulate_grad_batches=4`（默认值），在不增加显存的前提下将有效 batch 扩大 4 倍
-- 添加 `FeatureBank`（环形缓冲区，max_size=256），存储历史 clean 特征增广正样本集合
-- drift_loss 从各尺度求和改为求均值，使 loss 量级不随特征尺度数变化
-
----
-
-## 8. 代码结构
+## 7. 代码结构
 
 ```
 flowmse/

@@ -14,8 +14,10 @@ Key adaptations for SE:
   - Backbone reuse: NCSNpp with FiLM conditioning driven by input energy
 """
 
+import math
 import warnings
 import torch
+import torch.nn.functional as F
 import pytorch_lightning as pl
 
 from flowmse.backbones import BackboneRegistry
@@ -53,7 +55,7 @@ class DriftingSEModel(pl.LightningModule):
                             help="Learning rate")
         parser.add_argument("--ema_decay", type=float, default=0.999,
                             help="EMA decay for backbone parameters")
-        parser.add_argument("--num_eval_files", type=int, default=10,
+        parser.add_argument("--num_eval_files", type=int, default=150,
                             help="Number of validation files for evaluation")
         parser.add_argument("--loss_type", type=str, default="hybrid",
                             choices=["drifting", "hybrid", "mse"],
@@ -76,6 +78,18 @@ class DriftingSEModel(pl.LightningModule):
                             help="Use input energy as conditioning (1) or fixed t=1.0 (0)")
         parser.add_argument("--bank_size", type=int, default=256,
                             help="Feature memory bank size for positive samples (0=disabled)")
+        parser.add_argument("--complex_loss_weight", type=float, default=0.3,
+                            help="Weight of complex MSE relative to log-magnitude MSE in recon loss")
+        # LR scheduler
+        parser.add_argument("--lr_scheduler", type=str, default="cosine",
+                            choices=["none", "cosine"],
+                            help="LR scheduler: 'none' (flat) or 'cosine' (warmup + cosine decay)")
+        parser.add_argument("--warmup_epochs", type=int, default=5,
+                            help="Linear warmup epochs before cosine decay")
+        parser.add_argument("--lr_t_max", type=int, default=300,
+                            help="Total epoch budget for cosine schedule (including warmup)")
+        parser.add_argument("--lr_min", type=float, default=1e-6,
+                            help="Minimum learning rate at end of cosine decay")
         # Compatibility with evaluate flow (t_eps, T_rev unused but kept for interface)
         parser.add_argument("--t_eps", type=float, default=0.03)
         parser.add_argument("--T_rev", type=float, default=1.0)
@@ -88,7 +102,7 @@ class DriftingSEModel(pl.LightningModule):
         backbone,
         lr=1e-4,
         ema_decay=0.999,
-        num_eval_files=10,
+        num_eval_files=150,
         loss_type="hybrid",
         recon_weight=1.0,
         drift_weight=1.0,
@@ -99,6 +113,11 @@ class DriftingSEModel(pl.LightningModule):
         n_mels=80,
         energy_conditioning=1,
         bank_size=256,
+        complex_loss_weight=0.3,
+        lr_scheduler="cosine",
+        warmup_epochs=5,
+        lr_t_max=300,
+        lr_min=1e-6,
         t_eps=0.03,
         T_rev=1.0,
         loss_abs_exponent=0.5,
@@ -123,6 +142,11 @@ class DriftingSEModel(pl.LightningModule):
         self.stochastic = bool(stochastic)
         self.use_mel_features = bool(use_mel_features)
         self.energy_conditioning = bool(energy_conditioning)
+        self.complex_loss_weight = complex_loss_weight
+        self.lr_scheduler_type = lr_scheduler
+        self.warmup_epochs = warmup_epochs
+        self.lr_t_max = lr_t_max
+        self.lr_min = lr_min
         self.t_eps = t_eps
         self.T_rev = T_rev
         self._error_loading_ema = False
@@ -152,7 +176,27 @@ class DriftingSEModel(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.dnn.parameters(), lr=self.lr)
-        return optimizer
+        if self.lr_scheduler_type == "none":
+            return optimizer
+
+        warmup = self.warmup_epochs
+        t_max = self.lr_t_max
+        eta_min_ratio = self.lr_min / self.lr
+
+        def lr_lambda(epoch):
+            if epoch < warmup:
+                # Linear warmup from 1% to 100%
+                return max(0.01, epoch / max(1, warmup))
+            # Cosine decay to lr_min
+            progress = (epoch - warmup) / max(1, t_max - warmup)
+            progress = min(progress, 1.0)
+            return eta_min_ratio + (1 - eta_min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+        }
 
     def optimizer_step(self, *args, **kwargs):
         super().optimizer_step(*args, **kwargs)
@@ -269,9 +313,18 @@ class DriftingSEModel(pl.LightningModule):
         return torch.cat([spec.real, spec.imag], dim=1)
 
     def _reconstruction_loss(self, x_hat, x_clean):
-        """MSE reconstruction loss with mean reduction (matches drift loss scale)."""
-        err = x_hat - x_clean
-        loss = torch.mean(torch.square(err.abs()))
+        """Hybrid log-magnitude + complex MSE loss.
+
+        Log-magnitude MSE: correlates well with PESQ (spectral envelope).
+        Complex MSE (configurable weight): preserves waveform fidelity (SI-SDR).
+        """
+        mag_hat = x_hat.abs()
+        mag_clean = x_clean.abs()
+        log_mag_loss = F.mse_loss(torch.log(mag_hat + 1e-8), torch.log(mag_clean + 1e-8))
+        complex_loss = F.mse_loss(x_hat.real, x_clean.real) + F.mse_loss(x_hat.imag, x_clean.imag)
+        loss = log_mag_loss + self.complex_loss_weight * complex_loss
+        self.log("log_mag_loss", log_mag_loss, on_step=True, on_epoch=True)
+        self.log("complex_loss", complex_loss, on_step=True, on_epoch=True)
         return loss
 
     def _step(self, batch, batch_idx):

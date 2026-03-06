@@ -21,7 +21,7 @@ import os
 
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger, TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 
 from flowmse.backbones.shared import BackboneRegistry
 from flowmse.data_module import SpecsDataModule
@@ -130,6 +130,7 @@ if __name__ == "__main__":
             dirpath=model_dirpath, save_top_k=20, monitor="si_sdr",
             mode="max", filename="{epoch}_{si_sdr:.2f}",
         ),
+        LearningRateMonitor(logging_interval="epoch"),
     ]
 
     # Devices
